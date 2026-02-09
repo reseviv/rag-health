@@ -1,0 +1,62 @@
+########################################
+# OS / Editor
+########################################
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+########################################
+# Python
+########################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+.env
+.env.*
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+########################################
+# Logs / temp
+########################################
+*.log
+*.tmp
+*.swp
+
+########################################
+# RAG project outputs (generated)
+# (Recommended: keep code in git, regenerate data/index locally)
+########################################
+# Raw documents can be large / copyrighted
+data/raw/
+
+# Processed artifacts (chunks, embeddings, intermediate json)
+data/processed/
+
+# Vector indexes (FAISS, etc.)
+index/
+*.index
+*.faiss
+
+########################################
+# Optional: Cache / downloads
+########################################
+.cache/
+downloads/
+
+########################################
+# Optional: Jupyter
+########################################
+*.ipynb
