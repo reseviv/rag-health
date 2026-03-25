@@ -1,3 +1,5 @@
+import unicodedata
+
 from pypdf import PdfReader
 import re
 from pathlib import Path
@@ -19,6 +21,9 @@ def extract_pdf(pdf_path):
 
     for i, page in enumerate(reader.pages):
         text = page.extract_text()
+        text = normalise_text(text)
+        text = fix_pdf_artifacts(text)
+        
         if not text:
             continue
 
@@ -30,6 +35,49 @@ def extract_pdf(pdf_path):
             "text": text
         })
     return pages
+
+# text normalization
+def normalise_text(text):
+    text = unicodedata.normalize("NFKC", text)
+
+    replacements = {
+        "\u00a0": " ",
+        "\u00ad": "",
+        "ﬁ": "fi",
+        "ﬂ": "fl",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+def fix_pdf_artifacts(text):
+    # join spaced letters like "H o m e" -> "Home"
+    text = re.sub(
+        r"\b(?:[A-Za-z]\s){2,}[A-Za-z]\b",
+        lambda m: m.group(0).replace(" ", ""),
+        text
+    )
+
+    # remove isolated page numbers / roman numerals
+    text = re.sub(r"(?m)^\s*(?:\d+|[ivxlcdmIVXLCDM]+)\s*$", "", text)
+
+    # replace single newlines inside running text with spaces
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+
+    # restore paragraph spacing
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 # Split a text into paragraphs based on blank lines
 def split_paragraphs(text):
