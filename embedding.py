@@ -13,7 +13,7 @@ MODEL_NAME = "all-MiniLM-L6-v2" # fast, small, and efficient model ideal for rea
 # can also try all-mpnet-base-v2 in fine tuning, but it is much larger and slower to compute
 
 def load_chunks(path: Path) -> list[dict]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f: 
         return json.load(f)
 
 
