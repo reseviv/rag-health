@@ -90,7 +90,7 @@ def chunk_paragraphs(paragraphs, max_chars=500):
     current = ""
 
     for para in paragraphs:
-        if len(current) + len(para) + 2 <= max_chars:
+        if (len(current) + len(para) + 2 <= max_chars) or (len(current) <50):
             current = f"{current}\n\n{para}".strip()
         else:
             if current:
@@ -109,6 +109,8 @@ def process_all_pdfs():
     for pdf_path in RAW_DIR.glob("*.pdf"):
         topic = pdf_path.stem.lower()   # abortion / hiv / infertility
         source = f"WHO {topic.capitalize()} Guideline"
+        document_id = f"who_{topic}_guideline"
+        chunk_index = 0
 
         print(f"Processing {pdf_path.name}...")
         # split by page first
@@ -117,17 +119,22 @@ def process_all_pdfs():
         for p in pages:
             page_no = p["page"]
             paragraphs = split_paragraphs(p["text"])
-            page_chunks = chunk_paragraphs(paragraphs, max_chars=900)
+            page_chunks = chunk_paragraphs(paragraphs, max_chars=500)
 
             for chunk in page_chunks:
                 all_chunks.append({
-                    "chunk_id": f"{topic}_{chunk_id}",
-                    "text": chunk,
+                    "chunk_id": f"{topic}_{chunk_id:04d}",
+                    "document_id": document_id,
+                    "source_file": pdf_path.name,
                     "source": source,
                     "topic": topic,
-                    "page": page_no
+                    "page": page_no,
+                    "section": None,   # placeholder for now
+                    "chunk_index": chunk_index,
+                    "text": chunk
                 })
                 chunk_id += 1
+                chunk_index += 1
 
     return all_chunks
 
