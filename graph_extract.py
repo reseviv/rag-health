@@ -2,84 +2,17 @@ from pathlib import Path
 import json
 import re
 from collections import defaultdict
+import constant
 
-CHUNKS_FILE = Path("data/processed/chunks.json")
-ENTITIES_FILE = Path("data/interim/entities.json")
-RELATIONS_FILE = Path("data/interim/relations.json")
-
-
-# -----------------------------------
-# 1. Domain dictionaries / seed terms
-# -----------------------------------
-
-DOMAIN_TERMS = {
-    "condition": [
-        "hiv",
-        "abortion",
-        "infertility",
-        "pregnancy",
-        "complications",
-        "infection",
-        "haemorrhage",
-        "hemorrhage",
-        "pain",
-        "sepsis",
-    ],
-    "procedure": [
-        "abortion care",
-        "post-abortion care",
-        "contraception",
-        "counselling",
-        "counseling",
-        "follow-up",
-        "screening",
-        "testing",
-        "treatment",
-        "antiretroviral therapy",
-    ],
-    "actor": [
-        "health worker",
-        "health workers",
-        "clinician",
-        "clinicians",
-        "women",
-        "adolescents",
-        "patients",
-        "person",
-        "people",
-    ],
-    "organisation": [
-        "world health organization",
-        "who",
-    ],
-    "resource": [
-        "guideline",
-        "guidelines",
-        "service",
-        "services",
-        "care",
-        "support",
-    ]
-}
+CHUNKS_FILE = constant.CHUNKS_FILE
+ENTITIES_FILE = constant.ENTITIES_FILE
+RELATIONS_FILE = constant.RELATIONS_FILE
 
 
-ALIASES = {
-    "who": "world health organization",
-    "counselling": "counseling",
-    "health workers": "health worker",
-    "clinicians": "clinician",
-    "guidelines": "guideline",
-    "services": "service",
-    "women": "woman",
-    "adolescents": "adolescent",
-    "patients": "patient",
-    "complications": "complication",
-}
 
 
-# -----------------------------------
-# 2. Utility functions
-# -----------------------------------
+# Utility functions
+
 
 def load_chunks(path: Path) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -91,8 +24,8 @@ def normalise_entity_name(name: str) -> str:
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"[^\w\s\-]", "", name)
 
-    if name in ALIASES:
-        name = ALIASES[name]
+    if name in constant.ALIASES:
+        name = constant.ALIASES[name]
 
     return name
 
@@ -107,16 +40,15 @@ def find_term_mentions(text: str, term: str) -> bool:
 
 
 def infer_entity_type(entity_name: str) -> str:
-    for entity_type, term_list in DOMAIN_TERMS.items():
+    for entity_type, term_list in constant.DOMAIN_TERMS.items():
         for term in term_list:
             if normalise_entity_name(term) == entity_name:
                 return entity_type
     return "unknown"
 
 
-# -----------------------------------
 # 3. Entity extraction
-# -----------------------------------
+
 
 def extract_entities_from_chunk(chunk: dict) -> list[dict]:
     text = chunk["text"]
@@ -125,7 +57,7 @@ def extract_entities_from_chunk(chunk: dict) -> list[dict]:
     found = {}
 
     # 3a. Dictionary-based extraction
-    for entity_type, term_list in DOMAIN_TERMS.items():
+    for entity_type, term_list in constant.DOMAIN_TERMS.items():
         for term in term_list:
             if find_term_mentions(text_lower, term.lower()):
                 canonical = normalise_entity_name(term)
