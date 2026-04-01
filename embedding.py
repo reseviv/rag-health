@@ -9,8 +9,7 @@ INDEX_DIR = Path("index")
 INDEX_FILE = INDEX_DIR / "faiss.index"
 METADATA_FILE = INDEX_DIR / "metadata.json"
 
-MODEL_NAME = "all-MiniLM-L6-v2" # fast, small, and efficient model ideal for real-time applications and constrained environments
-# can also try all-mpnet-base-v2 in fine tuning, but it is much larger and slower to compute
+MODEL_NAME = "pritamdeka/S-PubMedBert-MS-MARCO"  # biomedical model trained on PubMed + MS MARCO retrieval task
 
 def load_chunks(path: Path) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f: 
