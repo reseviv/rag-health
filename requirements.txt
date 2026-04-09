@@ -1,0 +1,20 @@
+# RAG-Health dependencies
+# Python 3.11 recommended (3.14 lacks wheels for faiss-cpu / sentence-transformers)
+
+# Core retrieval
+faiss-cpu>=1.7.4
+sentence-transformers>=2.7.0
+numpy>=1.26.0
+
+# PDF ingestion
+pypdf>=4.0.0
+
+# Graph
+networkx>=3.2.0
+spacy>=3.7.0
+
+# LLM
+openai>=1.30.0
+
+# Utilities
+python-dotenv>=1.0.0
