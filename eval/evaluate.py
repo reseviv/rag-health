@@ -1,159 +1,168 @@
 """
-eval/evaluate.py — Scoring harness for experiment results
+eval/evaluate.py — Scoring harness for the graph-enriched RAG pipeline
 
-Reads:  results/experiment_*.json  (output of experiment.py)
-Scores: Faithfulness, Answer Relevancy, Context Recall (RAGAS)
-        ROUGE-L (rouge_score)
-        Latency stats (already in results)
-Writes: results/scores_<timestamp>.json  +  prints summary table
+Reads:   one or more results/experiment_*.json files
+Scores:
+  - ROUGE-L         lexical overlap with gold_answer
+  - BERTScore F1    semantic similarity with gold_answer (local model, no API)
+  - Entity Coverage fraction of gold_entities mentioned in the answer
+Breakdown:
+  - Per (llm, agent_mode) condition
+  - Simple vs multihop split
 
 Usage:
-    python eval/evaluate.py                              # scores latest results file
-    python eval/evaluate.py --file results/experiment_20260330_123456.json
-    python eval/evaluate.py --file results/experiment_*.json --no-ragas  # ROUGE-L only (no API key needed)
-
-Requirements:
-    pip install ragas rouge_score datasets
-    OPENAI_API_KEY must be set for RAGAS (uses LLM-as-judge)
+    python eval/evaluate.py                                   # score latest file
+    python eval/evaluate.py --files results/exp_A.json results/exp_B.json
+    python eval/evaluate.py --no-bert                        # ROUGE-L + entity only
 """
 
 import argparse
 import json
-import os
+import re
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# ------------------------------------------------------------------
-# Lazy imports — only loaded when needed
-# ------------------------------------------------------------------
-
-def _load_ragas():
-    from ragas import evaluate
-    from ragas.metrics import faithfulness, answer_relevancy, context_recall
-    from datasets import Dataset
-    return evaluate, faithfulness, answer_relevancy, context_recall, Dataset
-
-def _load_rouge():
-    from rouge_score import rouge_scorer
-    return rouge_scorer
-
 RESULTS_DIR = Path("results")
+
+
+# ------------------------------------------------------------------
+# Loaders
+# ------------------------------------------------------------------
+
+def load_results(paths: list[Path]) -> list[dict]:
+    results = []
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            results.extend(json.load(f))
+    return results
 
 
 # ------------------------------------------------------------------
 # ROUGE-L
 # ------------------------------------------------------------------
 
-def score_rouge(results: list[dict]) -> float | None:
-    """Compute mean ROUGE-L for a list of results. Returns None if no ground_truth available."""
-    rouge_scorer_mod = _load_rouge()
-    scorer = rouge_scorer_mod.RougeScorer(["rougeL"], use_stemmer=True)
-
-    scores = []
-    for r in results:
-        if not r.get("answer") or not r.get("ground_truth"):
-            continue
-        s = scorer.score(r["ground_truth"], r["answer"])
-        scores.append(s["rougeL"].fmeasure)
-
+def score_rouge_l(results: list[dict]) -> float | None:
+    from rouge_score import rouge_scorer
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    scores = [
+        scorer.score(r["gold_answer"], r["answer"])["rougeL"].fmeasure
+        for r in results
+        if r.get("answer") and r.get("gold_answer")
+    ]
     return round(sum(scores) / len(scores), 4) if scores else None
 
 
 # ------------------------------------------------------------------
-# RAGAS
+# BERTScore
 # ------------------------------------------------------------------
 
-def score_ragas(results: list[dict]) -> dict:
-    """
-    Run RAGAS metrics on a list of results (can be a condition subset).
-    Requires OPENAI_API_KEY (RAGAS uses LLM-as-judge internally).
+def score_bert(results: list[dict]) -> float | None:
+    from bert_score import score as bert_score_fn
+    pairs = [
+        (r["answer"], r["gold_answer"])
+        for r in results
+        if r.get("answer") and r.get("gold_answer")
+    ]
+    if not pairs:
+        return None
+    preds, refs = zip(*pairs)
+    _, _, F1 = bert_score_fn(list(preds), list(refs), lang="en", verbose=False)
+    return round(F1.mean().item(), 4)
 
-    faithfulness     — is the answer grounded in retrieved chunks?
-    answer_relevancy — does the answer address the question?
-    context_recall   — did we retrieve the right chunks? (needs ground_truth)
-    """
-    evaluate, faithfulness, answer_relevancy, context_recall, Dataset = _load_ragas()
 
-    rows = []
+# ------------------------------------------------------------------
+# Entity Coverage
+# ------------------------------------------------------------------
+
+def score_entity_coverage(results: list[dict]) -> float | None:
+    """
+    Fraction of gold_entities that appear (case-insensitive) in the generated answer.
+    Measures whether the answer mentions the right medical concepts.
+    """
+    scores = []
     for r in results:
-        if not r.get("answer") or not r.get("chunks"):
+        if not r.get("answer") or not r.get("gold_entities"):
             continue
-        rows.append({
-            "question": r["query"],
-            "answer": r["answer"],
-            "contexts": [c.get("text", "") for c in r.get("chunks", []) if c.get("text")],
-            "ground_truth": r.get("ground_truth", ""),
-        })
-
-    if not rows:
-        return {}
-
-    dataset = Dataset.from_list(rows)
-
-    metrics = [faithfulness, answer_relevancy]
-    if any(r.get("ground_truth") for r in rows):
-        metrics.append(context_recall)
-
-    result = evaluate(dataset, metrics=metrics)
-    return {k: round(float(v), 4) for k, v in result.items()}
+        answer_lower = r["answer"].lower()
+        hits = sum(
+            1 for e in r["gold_entities"]
+            if re.search(re.escape(e.lower()), answer_lower)
+        )
+        scores.append(hits / len(r["gold_entities"]))
+    return round(sum(scores) / len(scores), 4) if scores else None
 
 
 # ------------------------------------------------------------------
-# Aggregate scores by condition
+# Aggregation
 # ------------------------------------------------------------------
 
-def aggregate(results: list[dict], use_ragas: bool = False) -> list[dict]:
-    """
-    Group results by (llm, agent_mode, retriever) and compute per-condition scores.
-    ROUGE-L and RAGAS are computed independently for each condition group.
-    """
-    from collections import defaultdict
+def compute_scores(group: list[dict], use_bert: bool) -> dict:
+    ok = [r for r in group if r.get("status") == "ok"]
+    latencies = [r["latency_ms"] for r in ok if r.get("latency_ms")]
+    return {
+        "n_total": len(group),
+        "n_ok": len(ok),
+        "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+        "rouge_l": score_rouge_l(ok),
+        "bert_score_f1": score_bert(ok) if use_bert else None,
+        "entity_coverage": score_entity_coverage(ok),
+    }
 
-    groups: dict[tuple, list] = defaultdict(list)
+
+def aggregate(results: list[dict], use_bert: bool) -> dict:
+    # Group by (llm, agent_mode)
+    by_condition: dict[tuple, list] = defaultdict(list)
     for r in results:
-        key = (r["llm"], r["agent_mode"], r["retriever"])
-        groups[key].append(r)
+        by_condition[(r["llm"], r["agent_mode"])].append(r)
 
-    rows = []
-    for (llm, mode, db), group in sorted(groups.items()):
-        ok = [r for r in group if r["status"] == "ok"]
-        latencies = [r["latency_ms"] for r in ok]
+    condition_rows = []
+    for (llm, mode), group in sorted(by_condition.items()):
+        row = {"llm": llm, "agent_mode": mode}
+        row.update(compute_scores(group, use_bert))
+        condition_rows.append(row)
 
-        ragas = score_ragas(ok) if use_ragas else {}
+    # Split breakdown: simple vs multihop, per (llm, agent_mode)
+    split_rows = []
+    for (llm, mode), group in sorted(by_condition.items()):
+        for label, flag in [("simple", False), ("multihop", True)]:
+            subset = [r for r in group if r.get("requires_multihop") == flag]
+            if not subset:
+                continue
+            row = {"llm": llm, "agent_mode": mode, "split": label}
+            row.update(compute_scores(subset, use_bert))
+            split_rows.append(row)
 
-        rows.append({
-            "llm": llm,
-            "agent_mode": mode,
-            "retriever": db,
-            "n_total": len(group),
-            "n_ok": len(ok),
-            "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
-            "rouge_l": score_rouge(ok),
-            "faithfulness": ragas.get("faithfulness"),
-            "answer_relevancy": ragas.get("answer_relevancy"),
-            "context_recall": ragas.get("context_recall"),
-        })
-
-    return rows
+    return {"by_condition": condition_rows, "by_split": split_rows}
 
 
 # ------------------------------------------------------------------
-# Summary table printer
+# Printer
 # ------------------------------------------------------------------
 
-def print_table(rows: list[dict]) -> None:
-    header = f"{'LLM':<18} {'Mode':<12} {'DB':<10} {'OK':>4} {'Lat(ms)':>8} {'Faith':>7} {'AnsRel':>7} {'ROUGE-L':>8}"
-    print("\n" + "=" * len(header))
+def _fmt(val, decimals=3) -> str:
+    return f"{val:.{decimals}f}" if val is not None else "  —  "
+
+
+def print_table(rows: list[dict], title: str, split_col: bool = False) -> None:
+    col = f"{'Split':<10}" if split_col else ""
+    header = (
+        f"{'LLM':<16} {'Mode':<10} {col}"
+        f"{'OK':>5} {'Lat(ms)':>8} {'ROUGE-L':>8} {'BERTScore':>10} {'EntCov':>8}"
+    )
+    print(f"\n{title}")
+    print("=" * len(header))
     print(header)
     print("-" * len(header))
     for r in rows:
-        faith  = f"{r['faithfulness']:.3f}"  if r['faithfulness']  is not None else "  —  "
-        ansrel = f"{r['answer_relevancy']:.3f}" if r['answer_relevancy'] is not None else "  —  "
-        rouge  = f"{r['rouge_l']:.3f}"       if r['rouge_l']       is not None else "  —  "
-        lat    = str(r['avg_latency_ms']) if r['avg_latency_ms'] is not None else "—"
-        print(f"{r['llm']:<18} {r['agent_mode']:<12} {r['retriever']:<10} "
-              f"{r['n_ok']:>4} {lat:>8} {faith:>7} {ansrel:>7} {rouge:>8}")
-    print("=" * len(header) + "\n")
+        split_str = f"{r.get('split', ''):<10}" if split_col else ""
+        print(
+            f"{r['llm']:<16} {r['agent_mode']:<10} {split_str}"
+            f"{r['n_ok']:>5} {str(r['avg_latency_ms'] or '—'):>8} "
+            f"{_fmt(r['rouge_l']):>8} {_fmt(r['bert_score_f1']):>10} "
+            f"{_fmt(r['entity_coverage']):>8}"
+        )
+    print("=" * len(header))
 
 
 # ------------------------------------------------------------------
@@ -161,54 +170,53 @@ def print_table(rows: list[dict]) -> None:
 # ------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate experiment results")
-    parser.add_argument("--file", type=str, default=None,
-                        help="Path to results JSON. Defaults to latest in results/")
-    parser.add_argument("--no-ragas", action="store_true",
-                        help="Skip RAGAS (no OpenAI key needed) — ROUGE-L only")
+    parser = argparse.ArgumentParser(description="Evaluate RAG-Health experiment results")
+    parser.add_argument(
+        "--files", nargs="+", default=None,
+        help="Result JSON files to evaluate. Defaults to latest two experiment files.",
+    )
+    parser.add_argument(
+        "--no-bert", action="store_true",
+        help="Skip BERTScore (faster, no model download needed)",
+    )
     args = parser.parse_args()
 
-    # Find results file
-    if args.file:
-        results_file = Path(args.file)
+    # Resolve files
+    if args.files:
+        paths = [Path(f) for f in args.files]
     else:
-        files = sorted(RESULTS_DIR.glob("experiment_*.json"))
-        if not files:
+        all_files = sorted(RESULTS_DIR.glob("experiment_*.json"))
+        if not all_files:
             print(f"No experiment results found in {RESULTS_DIR}/")
-            print("Run experiment.py first.")
             return
-        results_file = files[-1]
-        print(f"Using latest results: {results_file}")
+        paths = all_files[-2:]  # default: latest two (simple + multihop)
+        print(f"Using: {[str(p) for p in paths]}")
 
-    with open(results_file, encoding="utf-8") as f:
-        results = json.load(f)
+    results = load_results(paths)
+    ok_count = sum(1 for r in results if r.get("status") == "ok")
+    print(f"Loaded {len(results)} results ({ok_count} successful) from {len(paths)} file(s)")
 
-    print(f"Loaded {len(results)} results from {results_file}")
+    use_bert = not args.no_bert
+    if use_bert:
+        print("Computing BERTScore (downloading model if needed)...")
 
-    use_ragas = False
-    if not args.no_ragas:
-        if not os.getenv("OPENAI_API_KEY"):
-            print("\nRAGAS skipped — OPENAI_API_KEY not set.")
-            print("  Run with --no-ragas to suppress this message, or set OPENAI_API_KEY.")
-        else:
-            use_ragas = True
-            print("\nRAGAS enabled — will score per condition (calls OpenAI API).")
+    print("\nAggregating scores...")
+    scores = aggregate(results, use_bert)
 
-    # Aggregate and score per condition
-    print("\nAggregating per-condition scores...")
-    rows = aggregate(results, use_ragas=use_ragas)
-    print_table(rows)
+    print_table(scores["by_condition"], "Results by condition")
+    print_table(scores["by_split"], "Results by split (simple vs multihop)", split_col=True)
 
-    # Save scores
+    # Save
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = RESULTS_DIR / f"scores_{timestamp}.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump({
-            "source_file": str(results_file),
-            "per_condition": rows,
+            "source_files": [str(p) for p in paths],
+            "by_condition": scores["by_condition"],
+            "by_split": scores["by_split"],
         }, f, indent=2, ensure_ascii=False)
-    print(f"Scores saved -> {out_file}")
+    print(f"\nScores saved -> {out_file}")
 
 
 if __name__ == "__main__":

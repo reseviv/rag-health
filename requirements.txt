@@ -9,12 +9,20 @@ numpy>=1.26.0
 # PDF ingestion
 pypdf>=4.0.0
 
-# Graph
+# Graph (scispaCy + models for graph_build.py + graph_retrieve.py)
 networkx>=3.2.0
 spacy>=3.7.0
+scispacy>=0.5.4
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz
 
 # LLM
 openai>=1.30.0
+
+# Evaluation
+ragas>=0.1.0
+datasets>=2.18.0
+rouge_score>=0.1.2
 
 # Utilities
 python-dotenv>=1.0.0

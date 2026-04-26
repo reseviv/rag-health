@@ -7,8 +7,10 @@ All models use the OpenAI-compatible API:
   - GPT:                     via api.openai.com
 
 Setup:
+    ollama serve   # keep running; app may start this automatically on macOS
     ollama pull qwen2.5:7b
-    ollama pull deepseek-r1:7b
+    ollama pull qwen2.5:1.5b   # lighter option for local smoke tests (see qwen-small)
+    ollama pull deepseek-r1:7b # optional
 
     # Optional cloud APIs (add to .env):
     DEEPSEEK_API_KEY=...
@@ -27,6 +29,12 @@ MODEL_CONFIGS: dict[str, dict] = {
         "base_url": "http://localhost:11434/v1",
         "api_key": "ollama",
         "model": "qwen2.5:7b",
+        "source": "ollama",
+    },
+    "qwen-small": {
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "model": "qwen2.5:1.5b",
         "source": "ollama",
     },
     "deepseek-local": {
