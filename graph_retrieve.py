@@ -1,10 +1,14 @@
 """
 graph_retrieve.py — Query phase
 
-Combines:
-  - SpaCy NER on query  →  Personalized PageRank on NetworkX graph  →  graph score per chunk
-  - SentenceTransformer embedding  →  FAISS cosine search  →  vector score per chunk
-  - Score fusion: alpha * graph_score + beta * vector_score
+Changes from v1:
+  - Query encoder: ncats/MedCPT-Query-Encoder (asymmetric pair with Article-Encoder)
+  - No fusion score: alpha/beta/fused_score removed
+  - Entity collection: query NER + chunk_to_entities from retrieved chunks
+  - Frequency filter: entity must appear in >= 2 retrieved chunks (query NER entities bypass)
+  - Entity cap: top 10 entities by retrieved-chunk frequency
+  - Graph neighbors: top 5 per entity by edge weight
+  - Returns: chunks list + entity_neighbors dict
 
 Usage:
     python graph_retrieve.py
@@ -17,37 +21,37 @@ import pickle
 from pathlib import Path
 
 import faiss
-import networkx as nx
 import numpy as np
 import spacy
-from sentence_transformers import SentenceTransformer
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+torch.set_num_threads(1)
 
 logger = logging.getLogger(__name__)
 
 GRAPH_FILE = Path("index/graph.pkl")
 FAISS_FILE = Path("index/faiss.index")
 METADATA_FILE = Path("index/metadata.json")
-MODEL_NAME = "pritamdeka/S-PubMedBert-MS-MARCO"  # biomedical model trained on PubMed + MS MARCO retrieval task
+QUERY_MODEL = "ncbi/MedCPT-Query-Encoder"
+NER_MODEL = "en_core_sci_lg"
+
+ENTITY_MIN_CHUNK_FREQ = 2   # entity must appear in >= this many retrieved chunks
+ENTITY_MAX_COUNT = 10       # max entities to send to graph after filtering
+NEIGHBOR_TOP_N = 5          # top N neighbors per entity by edge weight
 
 
 class GraphRetriever:
-    def __init__(self, alpha: float = 0.4, beta: float = 0.6, top_k: int = 5):
-        """
-        alpha  — weight for graph (PageRank) score
-        beta   — weight for vector (FAISS cosine) score
-        alpha + beta should equal 1.0
-        """
-        self.alpha = alpha
-        self.beta = beta
+    def __init__(self, top_k: int = 5):
         self.top_k = top_k
 
-        print("Loading scispaCy general science NER model (en_core_sci_lg)...")
-        self.nlp = spacy.load("en_core_sci_lg")
+        print(f"Loading NER model ({NER_MODEL})...")
+        self.nlp = spacy.load(NER_MODEL)
 
         print("Loading graph...")
         with open(GRAPH_FILE, "rb") as f:
             data = pickle.load(f)
-        self.G: nx.Graph = data["graph"]
+        self.G = data["graph"]
         self.entity_to_chunks: dict = data["entity_to_chunks"]
         self.chunk_to_entities: dict = data["chunk_to_entities"]
 
@@ -57,13 +61,13 @@ class GraphRetriever:
         print("Loading metadata...")
         with open(METADATA_FILE, encoding="utf-8") as f:
             metadata_list = json.load(f)
-        # Fast lookup: chunk_id -> metadata dict
         self.meta_by_chunk: dict = {m["chunk_id"]: m for m in metadata_list}
-        # Ordered list indexed by faiss_id (same order as index)
         self.metadata: list = metadata_list
 
-        print(f"Loading embedding model ({MODEL_NAME})...")
-        self.model = SentenceTransformer(MODEL_NAME)
+        print(f"Loading query encoder ({QUERY_MODEL})...")
+        self.query_tokenizer = AutoTokenizer.from_pretrained(QUERY_MODEL)
+        self.query_model = AutoModel.from_pretrained(QUERY_MODEL)
+        self.query_model.eval()
 
         print("GraphRetriever ready.\n")
 
@@ -71,123 +75,144 @@ class GraphRetriever:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _encode_query(self, query: str) -> np.ndarray:
+        inputs = self.query_tokenizer(
+            [query],
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=512,
+        )
+        with torch.no_grad():
+            outputs = self.query_model(**inputs)
+            emb = outputs.last_hidden_state[:, 0, :]
+            emb = torch.nn.functional.normalize(emb, dim=-1)
+        return emb.numpy().astype("float32")
+
     def _extract_query_entities(self, query: str) -> list[str]:
         doc = self.nlp(query)
         return [ent.text.lower().strip() for ent in doc.ents if len(ent.text.strip()) > 2]
 
-    def _vector_scores(self, query: str) -> dict[str, float]:
-        """FAISS cosine similarity for every chunk. Returns chunk_id -> score in [0, 1]."""
-        vec = self.model.encode([query], normalize_embeddings=True).astype("float32")
-        # Search all chunks so we can fuse across the full set
-        scores, indices = self.index.search(vec, len(self.metadata))
+    def _collect_entities(
+        self, query_entities: list[str], chunks: list[dict]
+    ) -> list[str]:
+        """
+        Combine query NER entities with entities from retrieved chunks.
+        Chunk entities are filtered to those appearing in >= ENTITY_MIN_CHUNK_FREQ chunks.
+        Query entities bypass the frequency filter.
+        Returns up to ENTITY_MAX_COUNT entities total.
+        """
+        # Count entity frequency across retrieved chunks
+        freq: dict[str, int] = {}
+        for chunk in chunks:
+            cid = chunk["chunk_id"]
+            for ent in self.chunk_to_entities.get(cid, []):
+                freq[ent] = freq.get(ent, 0) + 1
 
-        raw: dict[str, float] = {}
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            chunk_id = self.metadata[idx]["chunk_id"]
-            raw[chunk_id] = float(score)
+        # Chunk entities that pass frequency filter
+        chunk_entities = {e for e, f in freq.items() if f >= ENTITY_MIN_CHUNK_FREQ}
 
-        # Cosine scores from IndexFlatIP on normalised vecs are already in [-1, 1].
-        # Shift and scale to [0, 1] so they're comparable with graph scores.
-        if not raw:
-            return raw
-        min_s, max_s = min(raw.values()), max(raw.values())
-        rng = max_s - min_s or 1.0
-        return {k: (v - min_s) / rng for k, v in raw.items()}
+        # Query entities always included
+        query_set = set(query_entities)
 
-    def _graph_scores(self, query_entities: list[str], all_chunk_ids: list[str]) -> tuple[dict[str, float], str]:
-        """Personalized PageRank → per-chunk importance. Returns (chunk_id -> score in [0, 1], retrieval_mode)."""
-        zero = {cid: 0.0 for cid in all_chunk_ids}
+        # Combine: query entities first (priority), then chunk entities by freq
+        combined = list(query_set)
+        remaining = sorted(
+            chunk_entities - query_set,
+            key=lambda e: freq.get(e, 0),
+            reverse=True,
+        )
+        combined.extend(remaining)
 
-        if not query_entities:
-            logger.warning("GRAPH FALLBACK: NER found no entities in query — using vector-only retrieval.")
-            return zero, "vector_only:no_entities"
+        return combined[:ENTITY_MAX_COUNT]
 
-        if self.G.number_of_nodes() == 0:
-            logger.warning("GRAPH FALLBACK: graph has no nodes — using vector-only retrieval.")
-            return zero, "vector_only:empty_graph"
+    def _get_neighbors(self, entity: str) -> list[tuple[str, str, float]]:
+        """
+        Return top-N neighbors of entity sorted by edge weight.
+        Each result: (neighbor_name, predicate, weight)
+        Only returns neighbors that exist in graph.
+        """
+        if entity not in self.G:
+            return []
 
-        # Match query entities to graph nodes: exact first, then substring fallback
-        personalization: dict[str, float] = {}
-        for e in query_entities:
-            if e in self.G:
-                personalization[e] = 1.0
-            else:
-                # expand to all graph nodes that contain this entity as a substring
-                substring_matches = [n for n in self.G.nodes if e in n]
-                for n in substring_matches:
-                    personalization[n] = 1.0
+        neighbors = []
+        for neighbor in self.G.neighbors(entity):
+            edge = self.G[entity][neighbor]
+            neighbors.append((
+                neighbor,
+                edge.get("predicate", "co_occurs_with"),
+                edge.get("weight", 1),
+            ))
 
-        if not personalization:
-            logger.warning(
-                "GRAPH FALLBACK: entities %s found by NER but none matched graph nodes — "
-                "using vector-only retrieval.",
-                query_entities,
-            )
-            return zero, "vector_only:no_graph_match"
+        neighbors.sort(key=lambda x: x[2], reverse=True)
+        return neighbors[:NEIGHBOR_TOP_N]
 
-        matched = list(personalization.keys())
-        unmatched = [e for e in query_entities if e not in self.G and not any(e in n for n in self.G.nodes)]
-        if unmatched:
-            logger.info("GRAPH PARTIAL: entities %s matched graph; %s did not.", matched, unmatched)
+    def _build_entity_neighbors(
+        self, entities: list[str]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """
+        For each entity, get top-N neighbors.
+        Returns {entity: [(neighbor, predicate), ...]}
+        Globally deduplicates (entity, neighbor) pairs to avoid redundancy.
+        """
+        seen_pairs: set[frozenset] = set()
+        result: dict[str, list[tuple[str, str]]] = {}
 
-        pr = nx.pagerank(self.G, personalization=personalization, weight="weight")
+        for entity in entities:
+            neighbors = self._get_neighbors(entity)
+            unique = []
+            for neighbor, predicate, _ in neighbors:
+                pair = frozenset({entity, neighbor})
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    unique.append((neighbor, predicate))
+            if unique:
+                result[entity] = unique
 
-        # Accumulate entity PageRank scores into their associated chunks
-        chunk_scores: dict[str, float] = {cid: 0.0 for cid in all_chunk_ids}
-        for entity, score in pr.items():
-            for chunk_id in self.entity_to_chunks.get(entity, []):
-                if chunk_id in chunk_scores:
-                    chunk_scores[chunk_id] += score
-
-        # Normalize to [0, 1]
-        max_score = max(chunk_scores.values()) or 1.0
-        return {k: v / max_score for k, v in chunk_scores.items()}, "graph+vector"
+        return result
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def retrieve(self, query: str) -> list[dict]:
+    def retrieve(self, query: str) -> dict:
         """
-        Returns top-K chunks ranked by fused score.
-        Each result dict contains: chunk_id, text, source_file, page,
-        graph_score, vector_score, fused_score, query_entities.
+        Returns:
+          {
+            "chunks":          list of top-K chunk dicts (text, source, page, vector_score),
+            "entity_neighbors": {entity: [(neighbor, predicate), ...]},
+            "query_entities":  list of NER entities from query,
+          }
         """
-        # Step 1 — vector scores (FAISS)
-        v_scores = self._vector_scores(query)
-        all_chunk_ids = list(v_scores.keys())
+        # Step 1 — FAISS retrieval
+        vec = self._encode_query(query)
+        scores, indices = self.index.search(vec, self.top_k)
 
-        # Step 2 — graph scores (SpaCy NER + PageRank)
-        query_entities = self._extract_query_entities(query)
-        g_scores, retrieval_mode = self._graph_scores(query_entities, all_chunk_ids)
-
-        # Step 3 — fuse
-        fused = {
-            cid: self.alpha * g_scores.get(cid, 0.0) + self.beta * v_scores.get(cid, 0.0)
-            for cid in all_chunk_ids
-        }
-
-        # Step 4 — top-K
-        top_ids = sorted(fused, key=fused.__getitem__, reverse=True)[: self.top_k]
-
-        results = []
-        for cid in top_ids:
-            meta = self.meta_by_chunk.get(cid, {})
-            results.append({
-                "chunk_id": cid,
-                "text": meta.get("text", ""),
+        chunks = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            meta = self.metadata[idx]
+            chunks.append({
+                "chunk_id":    meta["chunk_id"],
+                "text":        meta.get("text", ""),
                 "source_file": meta.get("source_file", ""),
-                "page": meta.get("page", ""),
-                "graph_score": round(g_scores.get(cid, 0.0), 4),
-                "vector_score": round(v_scores.get(cid, 0.0), 4),
-                "fused_score": round(fused[cid], 4),
-                "query_entities": query_entities,
-                "retrieval_mode": retrieval_mode,
+                "page":        meta.get("page", ""),
+                "vector_score": round(float(score), 4),
             })
 
-        return results
+        # Step 2 — Entity collection
+        query_entities = self._extract_query_entities(query)
+        entities = self._collect_entities(query_entities, chunks)
+
+        # Step 3 — Graph neighbor lookup
+        entity_neighbors = self._build_entity_neighbors(entities)
+
+        return {
+            "chunks": chunks,
+            "entity_neighbors": entity_neighbors,
+            "query_entities": query_entities,
+        }
 
 
 # ------------------------------------------------------------------
@@ -195,21 +220,22 @@ class GraphRetriever:
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    retriever = GraphRetriever(alpha=0.4, beta=0.6, top_k=5)
+    retriever = GraphRetriever(top_k=5)
 
     queries = [
-        "What are the WHO guidelines for HIV treatment?",
+        "What are the WHO guidelines for HIV treatment in adolescents?",
         "How is infertility diagnosed?",
         "What are the risks of abortion care?",
     ]
 
     for query in queries:
-        print(f"Query : {query}")
-        results = retriever.retrieve(query)
-        print(f"Entities detected: {results[0]['query_entities'] if results else []}")
-        print()
-        for i, r in enumerate(results, 1):
-            print(f"  [{i}] {r['source_file']}  p.{r['page']}"
-                  f"  graph={r['graph_score']}  vec={r['vector_score']}  fused={r['fused_score']}")
-            print(f"       {r['text'][:120]}...")
+        print(f"\nQuery: {query}")
+        result = retriever.retrieve(query)
+        print(f"Query entities: {result['query_entities']}")
+        print(f"Chunks retrieved: {len(result['chunks'])}")
+        for c in result["chunks"]:
+            print(f"  [{c['vector_score']}] {c['source_file']} p.{c['page']} — {c['text'][:80]}...")
+        print(f"Entity neighbors ({len(result['entity_neighbors'])} entities):")
+        for ent, neighbors in list(result["entity_neighbors"].items())[:3]:
+            print(f"  {ent}: {neighbors}")
         print("-" * 70)
